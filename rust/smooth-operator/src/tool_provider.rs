@@ -97,6 +97,33 @@ pub struct ToolProviderContext {
     /// billed/scoped to. `None` when no key resolved. The shared crate does not
     /// interpret it.
     pub gateway_key: Option<String>,
+    /// An opaque credential letting a host tool act AS THE ACTING USER against
+    /// the host's own APIs (th-8400b7). `None` when the host does not supply one
+    /// — the default, and what every existing deployment gets.
+    ///
+    /// The shared crate does not interpret this, exactly as it does not
+    /// interpret [`gateway_key`](Self::gateway_key). That is deliberate: it
+    /// keeps the POLICY with the host. smooai puts a short-lived, narrowly
+    /// scoped minted token here rather than the raw session bearer, so a leak
+    /// costs five minutes and one scope instead of a reusable user session —
+    /// but a different host may forward whatever it likes, and this crate never
+    /// has to know which.
+    ///
+    /// ## Why this exists
+    ///
+    /// The operator verifies the connection's JWT and then hands tools only
+    /// [`AccessContext`] — user id, groups, org — with the bearer dropped. That
+    /// is the right default, and it had a cost: host tools could not call the
+    /// host's own REST API as the user, so smooai's copilot drawer grew raw-SQL
+    /// CRM writes that bypassed the routes' validation, write gate, outbound
+    /// sync and activity log. Its MCP surface, whose transport IS an
+    /// authenticated HTTP session, called the API and stayed correct. Two tool
+    /// stacks diverged on transport, field coverage and side effects because one
+    /// of them had no way to authenticate.
+    ///
+    /// A host that sets this can converge them. A host that does not is
+    /// unaffected.
+    pub user_token: Option<String>,
     /// Per-tool config from the agent's `tool_config.enabledTools[*].config`,
     /// keyed by tool id — the operator analog of `registry.ts`'s
     /// `toolSpecificConfig`. A host tool reads its own entry to configure itself
@@ -135,6 +162,7 @@ impl ToolProviderContext {
             access,
             conversation_id: None,
             gateway_key: None,
+            user_token: None,
             tool_specific_config: std::collections::HashMap::new(),
             directive_sink: None,
             images: Vec::new(),
@@ -156,6 +184,16 @@ impl ToolProviderContext {
     #[must_use]
     pub fn with_conversation_id(mut self, conversation_id: impl Into<String>) -> Self {
         self.conversation_id = Some(conversation_id.into());
+        self
+    }
+
+    /// Set the turn's [`user_token`](Self::user_token) — an opaque act-as-user
+    /// credential for the host's own APIs. Prefer a short-lived scoped token
+    /// over a long-lived session bearer; this crate cannot tell the difference
+    /// and will not try.
+    #[must_use]
+    pub fn with_user_token(mut self, user_token: impl Into<String>) -> Self {
+        self.user_token = Some(user_token.into());
         self
     }
 
@@ -269,6 +307,34 @@ mod tests {
         assert!(ctx.directive_sink.is_none());
         assert!(ctx.images.is_empty());
         assert!(ctx.files.is_empty());
+    }
+
+    /// th-8400b7 — the act-as-user credential is absent unless a host sets it.
+    ///
+    /// This is the security-relevant half. The operator drops the connection's
+    /// bearer by design; that default must survive adding a way to opt out of
+    /// it, or every existing deployment silently starts handing tools a
+    /// credential nobody asked it to carry.
+    #[test]
+    fn user_token_is_absent_by_default() {
+        let ctx = ToolProviderContext::new(Some("org".into()), AccessContext::default());
+        assert_eq!(
+            ctx.user_token, None,
+            "no host opted in, so no credential may be present"
+        );
+    }
+
+    /// A host that opts in gets the credential through, uninterpreted.
+    #[test]
+    fn user_token_round_trips_when_the_host_sets_it() {
+        // Deliberately not a JWT-shaped string: this crate must not care what
+        // the token IS. smooai puts a short-lived scoped token here; another
+        // host may forward something else entirely.
+        let ctx = ToolProviderContext::new(Some("org".into()), AccessContext::default())
+            .with_user_token("opaque-minted-abc123");
+        assert_eq!(ctx.user_token.as_deref(), Some("opaque-minted-abc123"));
+        // ...and it does not disturb the credential that was already here.
+        assert_eq!(ctx.gateway_key, None);
     }
 
     #[test]

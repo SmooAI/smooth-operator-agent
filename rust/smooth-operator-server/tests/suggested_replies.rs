@@ -65,6 +65,7 @@ async fn run_turn(deltas: &[&str]) -> (TurnResult, Vec<String>, String) {
             system_prompt: None,
             org_id: None,
             gateway_key: None,
+            user_token: None,
             workflow: None,
             judge: None,
             greeting_section: None,

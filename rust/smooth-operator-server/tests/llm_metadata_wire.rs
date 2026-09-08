@@ -98,6 +98,7 @@ async fn capture_request_body(request_metadata: Option<serde_json::Map<String, V
             system_prompt: None,
             org_id: None,
             gateway_key: None,
+            user_token: None,
             workflow: None,
             judge: None,
             greeting_section: None,

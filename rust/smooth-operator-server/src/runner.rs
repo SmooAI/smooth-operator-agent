@@ -608,6 +608,12 @@ pub struct TurnRequest<'a> {
     /// it to talk to the gateway itself — that comes from [`llm`](Self::llm); it
     /// only carries it through to the provider context.
     pub gateway_key: Option<String>,
+    /// Opaque act-as-user credential for the host's own APIs, carried through to
+    /// [`ToolProviderContext::user_token`](smooth_operator::tool_provider::ToolProviderContext::user_token)
+    /// (th-8400b7). `None` (the default) ⇒ the field is absent from the context
+    /// and every existing host behaves byte-for-byte as before. The runner never
+    /// reads it; it only hands it to the provider.
+    pub user_token: Option<String>,
     /// **Per-agent conversation workflow.** When `Some`, the runner injects the
     /// current step's intent/criteria into the system prompt and runs the judge
     /// after the turn to decide advancement. `None` (the default) ⇒ no workflow
@@ -718,6 +724,7 @@ pub async fn run_streaming_turn(
         system_prompt,
         org_id,
         gateway_key,
+        user_token,
         workflow,
         judge,
         greeting_section,
@@ -958,6 +965,13 @@ pub async fn run_streaming_turn(
             .with_files(files.clone());
         if let Some(key) = gateway_key {
             ctx = ctx.with_gateway_key(key);
+        }
+        // th-8400b7: the act-as-user credential, when the host supplies one.
+        // Threaded exactly like `gateway_key` and just as uninterpreted — the
+        // runner does not know or care whether it is a session bearer or a
+        // short-lived minted token. That choice is the host's.
+        if let Some(token) = user_token {
+            ctx = ctx.with_user_token(token);
         }
         // SEAM 3 — deliver per-tool config to host tools (registry.ts parity).
         if let Some(configs) = tool_configs.clone() {

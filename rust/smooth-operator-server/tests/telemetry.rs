@@ -154,6 +154,7 @@ fn base_turn_request() -> TurnRequest<'static> {
         system_prompt: None,
         org_id: Some("org-telemetry".to_string()),
         gateway_key: None,
+        user_token: None,
         workflow: None,
         judge: None,
         greeting_section: None,

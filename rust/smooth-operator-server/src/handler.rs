@@ -2087,6 +2087,11 @@ async fn handle_send_message(
                 // The per-org key resolved above, threaded so a host tool
                 // provider's retrieval tools call the same gateway this turn used.
                 gateway_key: turn_gateway_key,
+                user_token: None,
+                // th-8400b7: no act-as-user credential from the reference
+                // server. A host that wants its tools to call its own API as
+                // the user populates this; leaving it `None` keeps the existing
+                // behaviour exactly.
                 // SEAM 3 — per-agent conversation workflow + its cheap judge. Both
                 // `None` for a freeform agent, so the turn is unchanged.
                 workflow,
