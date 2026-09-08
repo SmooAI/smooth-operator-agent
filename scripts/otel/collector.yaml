@@ -1,0 +1,22 @@
+# Minimal collector for show-spans.sh: accept OTLP, print every span to stdout.
+# `debug` with detailed verbosity is what makes the span attributes readable —
+# the default verbosity prints counts only, which is useless for a demo whose
+# whole point is the attributes.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    logs:
+      level: info    # the debug exporter writes THROUGH this logger — warn silences the spans
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
