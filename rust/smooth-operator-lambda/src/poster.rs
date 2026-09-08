@@ -64,6 +64,16 @@ impl ConnectionPoster {
         }
     }
 
+    /// The API Gateway connection id this poster writes to, when it has one.
+    /// `None` for the capturing test variant, which is not tied to a connection.
+    #[must_use]
+    pub fn connection_id(&self) -> Option<&str> {
+        match self {
+            Self::ApiGateway { connection_id, .. } => Some(connection_id),
+            Self::Capturing(_) => None,
+        }
+    }
+
     /// Build a poster for `connection_id`, routing through the Management API
     /// callback endpoint `https://{domain_name}/{stage}`.
     ///

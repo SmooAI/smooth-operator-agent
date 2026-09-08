@@ -131,3 +131,83 @@ async fn unknown_action_is_a_protocol_error() {
     );
     assert_eq!(types(&poster), vec!["error"]);
 }
+
+/// `list_conversations` must be SERVED, not refused.
+///
+/// This is the regression the serverless smoke actually hit: the transport
+/// implemented four protocol actions and answered `UNSUPPORTED_ACTION` for the
+/// rest, so a client that had connected, created a session and was about to
+/// send a message fell over on the sidebar query. It is now delegated to the
+/// reference server's handler, which owns the org + per-user read predicate.
+///
+/// The list comes back empty — the session has no messages yet, and the server
+/// filters empty conversations out of the sidebar — so what is asserted is the
+/// shape: a successful response carrying a `conversations` array, never an
+/// error.
+#[tokio::test]
+async fn list_conversations_is_delegated_not_refused() {
+    let (storage, config, auth, poster) = harness();
+    let create = json!({
+        "action": "create_conversation_session",
+        "requestId": "req-c",
+        "agentId": "agent-1",
+        "userName": "smoke",
+    })
+    .to_string();
+    dispatch::handle_frame(&storage, &config, &auth, &poster, &create)
+        .await
+        .expect("create_conversation_session must not error");
+
+    let (storage2, config2, auth2, poster2) =
+        (storage.clone(), config, auth, ConnectionPoster::capturing());
+    let frame = json!({ "action": "list_conversations", "requestId": "req-l" }).to_string();
+    dispatch::handle_frame(&storage2, &config2, &auth2, &poster2, &frame)
+        .await
+        .expect("list_conversations must not error");
+
+    assert_ne!(
+        types(&poster2),
+        vec!["error"],
+        "list_conversations must not come back as UNSUPPORTED_ACTION"
+    );
+    let captured = poster2.captured();
+    assert!(
+        captured.iter().any(|e| e
+            .pointer("/data/conversations")
+            .is_some_and(Value::is_array)),
+        "a `conversations` array must come back nested under `data`, got {captured:?}"
+    );
+}
+
+/// The negative control for the delegation, and the reason it is an allowlist
+/// rather than a catch-all.
+///
+/// `confirm_tool_action` resumes a turn parked in connection-local state. A
+/// Lambda invocation that already returned holds no such turn, so delegating it
+/// would produce a handler that looks wired and silently never completes. It
+/// must keep answering `UNSUPPORTED_ACTION` — an honest "this transport
+/// cannot". If someone widens `DELEGATED_ACTIONS` to everything the server
+/// handles, this test is what fails.
+#[tokio::test]
+async fn connection_stateful_actions_stay_unsupported() {
+    for action in ["confirm_tool_action", "verify_otp", "submit_interaction"] {
+        let (storage, config, auth, poster) = harness();
+        let frame = json!({ "action": action, "requestId": "req-x" }).to_string();
+        dispatch::handle_frame(&storage, &config, &auth, &poster, &frame)
+            .await
+            .expect("must not fail the invocation");
+        assert_eq!(
+            types(&poster),
+            vec!["error"],
+            "{action} must stay unsupported on the lambda transport"
+        );
+        let captured = poster.captured();
+        assert_eq!(
+            captured[0]
+                .pointer("/data/error/code")
+                .and_then(Value::as_str),
+            Some("UNSUPPORTED_ACTION"),
+            "{action} must be refused as UNSUPPORTED_ACTION, got {captured:?}"
+        );
+    }
+}
