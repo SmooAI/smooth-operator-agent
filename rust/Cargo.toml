@@ -40,7 +40,7 @@ smooai-smooth-operator-core = "1.10.0"
 # Intra-workspace dep on the reference lib carries its version so the adapters /
 # ingestion / server that depend on it are publishable (path = local dev,
 # version = the crates.io requirement).
-smooth-operator = { package = "smooai-smooth-operator", path = "smooth-operator", version = "1.58.9" }
+smooth-operator = { package = "smooai-smooth-operator", path = "smooth-operator", version = "1.58.10" }
 
 async-trait = "0.1"
 anyhow = "1"

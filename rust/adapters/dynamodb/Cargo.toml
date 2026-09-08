@@ -1,6 +1,6 @@
 [package]
 name = "smooai-smooth-operator-adapter-dynamodb"
-version = "1.58.9"
+version = "1.58.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,7 +19,7 @@ s3-vectors = ["dep:aws-sdk-s3vectors", "dep:aws-smithy-types"]
 smooth-operator = { workspace = true }
 smooai-smooth-operator-core = { workspace = true }
 # IndexingStore / IndexingRun for the persistent admin indexing-runs store.
-smooai-smooth-operator-ingestion = { path = "../../ingestion", version = "1.58.9" }
+smooai-smooth-operator-ingestion = { path = "../../ingestion", version = "1.58.10" }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
