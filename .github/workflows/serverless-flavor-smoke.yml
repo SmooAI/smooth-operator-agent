@@ -160,25 +160,57 @@ jobs:
             #                bare host and proves nothing.
             # So the failure signal is specifically an INSTANT 403 on the stage
             # path. Do not read the bare-host 403 as a second symptom; it is not.
-            - name: Probe the raw WebSocket handshake
+            # Wait for the stage to actually SERVE before smoking it.
+            #
+            # The deploy returning is not the same as the edge serving: on the
+            # run that chased this for a day, deployment `uk103t` was DEPLOYED at
+            # 14:05:52 and the probe 9 seconds later still got 403 — with ZERO
+            # bytes in that stage's own access log and every Lambda log group
+            # empty, i.e. API Gateway had not picked the new stage up yet. Routes,
+            # integrations, invoke permissions, route auth and
+            # DisableExecuteApiEndpoint were all verified correct; the only thing
+            # wrong was asking too early.
+            #
+            # Reading the result, established against a known-good SST WebSocket
+            # API in the same account:
+            #   accepted -> curl TIMES OUT (exit 28). API Gateway takes the
+            #               upgrade and holds the socket, so curl never gets a
+            #               response. That is SUCCESS, however odd it looks.
+            #   refused  -> 403 {"message":"Forbidden"}.
+            # (The bare host answers 403 even on a healthy API, so it is not a
+            # useful probe and is not tried here.)
+            - name: Wait for the WebSocket stage to serve
               env:
                   WS: ${{ steps.deploy.outputs.ws }}
               run: |
                   https_url="${WS/wss:/https:}"
-                  echo "handshake -> $https_url"
-                  curl -isS --http1.1 --max-time 20 \
-                       -H "Connection: Upgrade" \
-                       -H "Upgrade: websocket" \
-                       -H "Sec-WebSocket-Version: 13" \
-                       -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
-                       "$https_url" | head -20 || true
-                  echo "── same host, no stage path (expect a different status if the stage path is the problem)"
-                  base="${https_url%/*}"
-                  curl -isS --http1.1 --max-time 20 \
-                       -H "Connection: Upgrade" -H "Upgrade: websocket" \
-                       -H "Sec-WebSocket-Version: 13" \
-                       -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
-                       "$base/" | head -12 || true
+                  echo "waiting for the stage to serve: $https_url"
+                  deadline=$((SECONDS + 180))
+                  while :; do
+                      # `&& rc=0 || rc=$?` because the step runs under `bash -e`:
+                      # a bare assignment from a failing command substitution
+                      # would abort the step, and a curl TIMEOUT is the outcome
+                      # we are waiting FOR.
+                      code=$(curl -sS -o /dev/null -w '%{http_code}' --http1.1 --max-time 10 \
+                                  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                                  -H "Sec-WebSocket-Version: 13" \
+                                  -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+                                  "$https_url" 2>/dev/null) && rc=0 || rc=$?
+                      if [ "$rc" -eq 28 ] || [ "$code" = "101" ]; then
+                          echo "stage is serving after ${SECONDS}s (curl rc=$rc http=$code)"
+                          break
+                      fi
+                      if [ "$SECONDS" -ge "$deadline" ]; then
+                          echo "::error::stage still refusing after ${SECONDS}s (curl rc=$rc http=$code) — this is a real misconfiguration, not propagation"
+                          curl -isS --http1.1 --max-time 10 \
+                               -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                               -H "Sec-WebSocket-Version: 13" \
+                               -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+                               "$https_url" | head -20 || true
+                          exit 1
+                      fi
+                      sleep 5
+                  done
 
             - name: Smoke the deployed stage
               working-directory: examples/web-chat
