@@ -191,6 +191,8 @@ jobs:
             # be destroyed. Best-effort — never fail the run for a missing log.
             - name: Lambda logs on failure
               if: failure()
+              env:
+                  WS: ${{ steps.deploy.outputs.ws }}
               run: |
                   # Do NOT guess the function-name prefix. SST TRUNCATES the app
                   # name to fit Lambda's 64-char limit, inconsistently per route —
@@ -207,8 +209,17 @@ jobs:
 
                   api=$(aws apigatewayv2 get-apis \
                           --query "Items[?contains(Name,'$STAGE')].ApiId" --output text 2>/dev/null | head -1)
-                  echo "───── API $api"
+                  # Cross-check that this is the API the deploy actually handed us.
+                  # The lookup matches on the stage string in the NAME, so a
+                  # leftover API from an earlier failed run of the same stage would
+                  # also match — and every field below would then describe the wrong
+                  # API while looking perfectly healthy.
+                  echo "───── API $api  (deployed URL was ${WS:-<unset>})"
                   [ -n "$api" ] || exit 0
+                  case "${WS:-}" in
+                      *"$api"*) echo "   ✓ api id matches the deployed URL" ;;
+                      *) echo "::warning::api id '$api' is NOT the one in the deployed URL — inspecting the WRONG api" ;;
+                  esac
                   echo "-- routes (RouteKey / AuthorizationType / ApiKeyRequired / Target)"
                   # AuthorizationType is the field that matters for a 403 at the
                   # edge: API Gateway refuses before routing to the integration,
