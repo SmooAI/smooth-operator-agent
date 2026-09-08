@@ -108,11 +108,17 @@ pub enum Direction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentItem {
-    /// Content item type discriminator. Currently only `"text"` is defined.
+    /// Content item type discriminator: `"text"` or `"image"`.
     #[serde(rename = "type")]
     pub item_type: String,
+    /// The text content (present when `type = "text"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// A `data:`/`https` image URL (present when `type = "image"`). Persisting it
+    /// on the stored user message is what lets a DIFFERENT client re-render an
+    /// image another client attached — cross-client conversation parity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl ContentItem {
@@ -121,6 +127,16 @@ impl ContentItem {
         Self {
             item_type: "text".to_string(),
             text: Some(text.into()),
+            url: None,
+        }
+    }
+
+    /// Build an `image` content item from a `data:`/`https` URL.
+    pub fn image(url: impl Into<String>) -> Self {
+        Self {
+            item_type: "image".to_string(),
+            text: None,
+            url: Some(url.into()),
         }
     }
 }
@@ -144,6 +160,23 @@ impl MessageContent {
         let text = text.into();
         Self {
             items: vec![ContentItem::text(text.clone())],
+            text: Some(text),
+            structured_response: None,
+        }
+    }
+
+    /// A text item plus one `image` item per URL. Used to persist a user turn's
+    /// attached images so another client rendering this conversation's history
+    /// re-shows them (cross-client parity). With no URLs this is `from_text`.
+    pub fn from_text_and_images(
+        text: impl Into<String>,
+        image_urls: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let text = text.into();
+        let mut items = vec![ContentItem::text(text.clone())];
+        items.extend(image_urls.into_iter().map(ContentItem::image));
+        Self {
+            items,
             text: Some(text),
             structured_response: None,
         }
@@ -427,6 +460,43 @@ mod tests {
         assert_eq!(v["from"]["type"], json!("user"));
         let back: Message = serde_json::from_value(v).unwrap();
         assert_eq!(back.direction, Direction::Inbound);
+    }
+
+    #[test]
+    fn content_with_images_serializes_image_items_web_reads() {
+        // th-1fca98: a user turn's attached images are persisted as `image`
+        // content items so ANOTHER client re-renders them from history. This is
+        // the exact wire shape the web SPA parses (`items[].type` / `items[].url`).
+        let c = MessageContent::from_text_and_images(
+            "look at this",
+            [
+                "data:image/png;base64,AAAA".to_string(),
+                "https://x/y.png".to_string(),
+            ],
+        );
+        let v = serde_json::to_value(&c).unwrap();
+        // Text item first (flat-text mirror preserved), then one image item per URL.
+        assert_eq!(v["items"][0]["type"], json!("text"));
+        assert_eq!(v["items"][0]["text"], json!("look at this"));
+        assert_eq!(v["text"], json!("look at this"));
+        assert_eq!(v["items"][1]["type"], json!("image"));
+        assert_eq!(v["items"][1]["url"], json!("data:image/png;base64,AAAA"));
+        assert_eq!(v["items"][2]["type"], json!("image"));
+        assert_eq!(v["items"][2]["url"], json!("https://x/y.png"));
+        // A text item carries no `url` key (skip_serializing_if None).
+        assert!(v["items"][0].get("url").is_none());
+        // Round-trips back through the domain type.
+        let back: MessageContent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.items.len(), 3);
+        assert_eq!(back.items[1].item_type, "image");
+        assert_eq!(
+            back.items[1].url.as_deref(),
+            Some("data:image/png;base64,AAAA")
+        );
+        // No images ⇒ identical to from_text (no regression to text-only turns).
+        let text_only = MessageContent::from_text_and_images("hi", std::iter::empty());
+        assert_eq!(text_only.items.len(), 1);
+        assert_eq!(text_only.items[0].item_type, "text");
     }
 
     #[test]

@@ -125,19 +125,23 @@
     },
     "ContentItem": {
       "title": "ContentItem",
-      "description": "A single content element within a message. Currently only `text` items are defined; additional types (image, file, tool_result) may be added in future protocol versions.",
+      "description": "A single content element within a message. `text` and `image` items are defined; further types (file, tool_result) may be added in future protocol versions.",
       "type": "object",
       "required": ["type"],
       "additionalProperties": false,
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["text"],
+          "enum": ["text", "image"],
           "description": "Content item type discriminator."
         },
         "text": {
           "type": "string",
           "description": "The text content (required when type = `text`)."
+        },
+        "url": {
+          "type": "string",
+          "description": "A `data:`/`https` image URL (required when type = `image`). Persisted on the user turn so any client can re-render an image another client attached."
         }
       }
     }

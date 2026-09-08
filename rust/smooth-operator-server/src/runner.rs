@@ -784,12 +784,15 @@ pub async fn run_streaming_turn(
     //    so prior_messages is exactly the history-up-to-now.
     let prior = load_prior_messages(storage.as_ref(), conversation_id).await?;
 
-    // 2. Persist the inbound user message.
+    // 2. Persist the inbound user message, including any images attached to this
+    //    turn so another client reading the history re-renders them (th-1fca98).
+    let user_image_urls: Vec<String> = images.iter().map(|img| img.url.clone()).collect();
     persist_message(
         storage.as_ref(),
         conversation_id,
         Direction::Inbound,
         user_message,
+        &user_image_urls,
     )
     .await?;
 
@@ -1466,6 +1469,7 @@ pub async fn run_streaming_turn(
             conversation_id,
             Direction::Outbound,
             &reply,
+            &[],
         )
         .await?
         .id
@@ -1809,20 +1813,31 @@ async fn load_prior_messages(
 }
 
 /// Append a single message to the conversation's log via the adapter.
+///
+/// `image_urls` (the inbound user turn's attached images) are persisted as
+/// `image` content items alongside the text so a DIFFERENT client rendering this
+/// conversation's history re-shows them — cross-client parity (th-1fca98). Pass
+/// an empty slice for text-only messages (e.g. the outbound reply).
 async fn persist_message(
     storage: &dyn StorageAdapter,
     conversation_id: &str,
     direction: Direction,
     text: &str,
+    image_urls: &[String],
 ) -> Result<DomainMessage> {
     let now = chrono::Utc::now();
+    let content = if image_urls.is_empty() {
+        MessageContent::from_text(text)
+    } else {
+        MessageContent::from_text_and_images(text, image_urls.iter().cloned())
+    };
     let message = DomainMessage {
         id: uuid::Uuid::new_v4().to_string(),
         external_id: None,
         organization_id: None,
         conversation_id: Some(conversation_id.to_string()),
         direction,
-        content: MessageContent::from_text(text),
+        content,
         from: None,
         to: None,
         metadata_json: None,
