@@ -1,6 +1,6 @@
 {
     "name": "@smooai/smooth-operator",
-    "version": "1.58.9",
+    "version": "1.58.10",
     "description": "TypeScript SDK for the smooth-operator WebSocket protocol: the native client (`.`), React bindings (`./react`), and the embeddable web-component chat widget (`./widget`). Generated from the language-neutral JSON Schemas in spec/.",
     "license": "MIT",
     "type": "module",

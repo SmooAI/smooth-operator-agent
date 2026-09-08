@@ -14,7 +14,7 @@
          scripts/sync-versions.mjs (do NOT confuse with the SmooAI.SmoothOperator.Core
          PackageReference version below, which tracks the separately-published engine). -->
     <PackageId>SmooAI.SmoothOperator.Server</PackageId>
-    <Version>1.58.9</Version>
+    <Version>1.58.10</Version>
     <Authors>SmooAI</Authors>
     <PackageTags>ai;agent;llm;chat;smooth-operator;server;websocket;smooai</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

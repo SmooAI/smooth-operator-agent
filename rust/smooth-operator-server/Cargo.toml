@@ -1,6 +1,6 @@
 [package]
 name = "smooai-smooth-operator-server"
-version = "1.58.9"
+version = "1.58.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -35,22 +35,22 @@ smooth-operator = { workspace = true }
 smooai-smooth-operator-core = { workspace = true }
 # In-memory storage + backplane — ALWAYS included. The local-flavor default and
 # the lean (`--no-default-features`) build run entirely on these.
-smooai-smooth-operator-adapter-memory = { path = "../adapters/in-memory", version = "1.58.9" }
+smooai-smooth-operator-adapter-memory = { path = "../adapters/in-memory", version = "1.58.10" }
 # Persistent storage + admin-store backends, selected at runtime to match the
 # configured storage backend (Postgres / DynamoDB; default in-memory). Optional:
 # gated behind the `postgres` / `dynamodb` features so a lean local/embed build
 # can exclude tokio-postgres / the AWS SDK. The `postgres` crate also provides the
 # gateway-backed embedder/reranker, so the `postgres` feature additionally enables
 # the semantic-retrieval path in `embedder.rs` / `reranker.rs`.
-smooai-smooth-operator-adapter-postgres = { path = "../adapters/postgres", version = "1.58.9", optional = true }
-smooai-smooth-operator-adapter-dynamodb = { path = "../adapters/dynamodb", version = "1.58.9", optional = true }
+smooai-smooth-operator-adapter-postgres = { path = "../adapters/postgres", version = "1.58.10", optional = true }
+smooai-smooth-operator-adapter-dynamodb = { path = "../adapters/dynamodb", version = "1.58.10", optional = true }
 # Distributed Backplane backends for horizontal scale-out, selected at runtime
 # via SMOOTH_AGENT_BACKPLANE (default in-memory / single-process). Optional: gated
 # behind the `redis` / `nats` features so a lean build excludes their drivers.
-smooai-smooth-operator-adapter-backplane-redis = { path = "../adapters/backplane-redis", version = "1.58.9", optional = true }
-smooai-smooth-operator-adapter-backplane-nats = { path = "../adapters/backplane-nats", version = "1.58.9", optional = true }
+smooai-smooth-operator-adapter-backplane-redis = { path = "../adapters/backplane-redis", version = "1.58.10", optional = true }
+smooai-smooth-operator-adapter-backplane-nats = { path = "../adapters/backplane-nats", version = "1.58.10", optional = true }
 # Admin API surfaces indexing-run status via the ingestion crate's IndexingStore.
-smooai-smooth-operator-ingestion = { path = "../ingestion", version = "1.58.9" }
+smooai-smooth-operator-ingestion = { path = "../ingestion", version = "1.58.10" }
 
 async-trait = { workspace = true }
 anyhow = { workspace = true }

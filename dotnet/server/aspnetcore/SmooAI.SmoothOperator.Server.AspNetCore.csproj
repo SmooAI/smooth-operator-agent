@@ -15,7 +15,7 @@
          attribute. (Keep the element-form version out of comments: the sync regex
          replaces the first element-form match in the file.) -->
     <PackageId>SmooAI.SmoothOperator.Server.AspNetCore</PackageId>
-    <Version>1.58.9</Version>
+    <Version>1.58.10</Version>
     <Authors>SmooAI</Authors>
     <PackageTags>ai;agent;llm;chat;smooth-operator;server;aspnetcore;websocket;smooai</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

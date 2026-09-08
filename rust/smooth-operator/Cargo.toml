@@ -1,6 +1,6 @@
 [package]
 name = "smooai-smooth-operator"
-version = "1.58.9"
+version = "1.58.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
