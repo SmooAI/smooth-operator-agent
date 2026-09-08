@@ -15,7 +15,12 @@
 name: serverless flavor smoke
 
 on:
-    workflow_dispatch: {}
+    workflow_dispatch:
+        inputs:
+            keep:
+                description: 'Leave the stage up after the run (manual debugging). The daily sweeper still reaps it.'
+                type: boolean
+                default: false
     pull_request:
         paths:
             - 'rust/smooth-operator-lambda/**'
@@ -146,6 +151,15 @@ jobs:
             # "API Gateway refused the path" (403) from "the integration blew up"
             # (500) — and with every Lambda log group empty, that distinction is
             # the entire question.
+            #
+            # How to READ the two results, established against a known-good SST
+            # WebSocket API in the same account (smooai-brentrager-RealtimeApi):
+            #   /$default -> curl HANGS with no response. That is SUCCESS: API
+            #                Gateway accepted the upgrade and holds the socket.
+            #   /         -> 403 {"message":"Forbidden"}. That is NORMAL on the
+            #                bare host and proves nothing.
+            # So the failure signal is specifically an INSTANT 403 on the stage
+            # path. Do not read the bare-host 403 as a second symptom; it is not.
             - name: Probe the raw WebSocket handshake
               env:
                   WS: ${{ steps.deploy.outputs.ws }}
@@ -220,9 +234,39 @@ jobs:
                         | head -c 600 || echo "  (no resource policy — API Gateway CANNOT invoke it)"
                       echo
                   done
-                  echo "-- stages"
-                  aws apigatewayv2 get-stages --api-id "$api" \
-                      --query 'Items[].[StageName,AutoDeploy,DeploymentId]' --output text 2>/dev/null || true
+                  # The WHOLE stage, not three hand-picked fields. `AutoDeploy: true`
+                  # plus a DeploymentId looks healthy and is not: auto-deploy can
+                  # FAIL and leave the stage pinned to an empty/older deployment,
+                  # in which case API Gateway matches no route and answers 403
+                  # before any integration runs — exactly the signature here.
+                  # `LastDeploymentStatusMessage` is the field that says so, and it
+                  # was omitted from every earlier version of this dump.
+                  echo "-- stage (full)"
+                  aws apigatewayv2 get-stages --api-id "$api" --output json 2>/dev/null || true
+
+                  dep=$(aws apigatewayv2 get-stages --api-id "$api" \
+                          --query 'Items[0].DeploymentId' --output text 2>/dev/null)
+                  if [ -n "$dep" ] && [ "$dep" != "None" ]; then
+                      echo "-- deployment $dep"
+                      aws apigatewayv2 get-deployment --api-id "$api" --deployment-id "$dep" \
+                          --query '[DeploymentStatus,DeploymentStatusMessage]' --output text 2>/dev/null || true
+                  fi
+
+                  # The API's OWN access log — the only place that records a request
+                  # API Gateway refused before routing. Resolve it from the stage's
+                  # DestinationArn rather than guessing the name: SST derives it from
+                  # a truncated physical name, so it does not reliably contain the
+                  # stage string the log-group loop above filters on.
+                  alg=$(aws apigatewayv2 get-stages --api-id "$api" \
+                          --query 'Items[0].AccessLogSettings.DestinationArn' --output text 2>/dev/null)
+                  case "$alg" in
+                      arn:aws:logs:*)
+                          alg=${alg#*:log-group:}; alg=${alg%:\*}
+                          echo "───── access log $alg"
+                          aws logs tail "$alg" --since 20m --format short 2>/dev/null | tail -40 || true
+                          ;;
+                      *) echo "-- no access log configured on the stage" ;;
+                  esac
 
             # ALWAYS — a failed probe must still cost nothing tomorrow — but only
             # once a deploy was actually ATTEMPTED. Unconditional `always()` fired
@@ -230,7 +274,9 @@ jobs:
             # teardown itself died on `pnpm: command not found` and reported a
             # second, misleading failure on a run that had created nothing.
             - name: Tear down
-              if: always() && steps.deploy.conclusion != 'skipped'
+              # `inputs.keep` is only ever true on a workflow_dispatch; on a PR run
+              # it is empty, so the guard is inert and teardown stays unconditional.
+              if: always() && steps.deploy.conclusion != 'skipped' && inputs.keep != true
               # continue-on-error so a teardown failure does not MASK the real
               # failure above it — but it still shows as a red step, and the
               # daily sweeper is the backstop that actually guarantees no leak.
