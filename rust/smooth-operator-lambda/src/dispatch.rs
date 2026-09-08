@@ -36,14 +36,43 @@ use smooth_operator::auth::AuthVerifier;
 use smooth_operator::domain::{
     Conversation, Participant, ParticipantType, Platform, Session, SessionStatus,
 };
+use smooth_operator_server::handler::{self, UserScope};
 use smooth_operator_server::runner::TurnRequest;
-use smooth_operator_server::{protocol, runner};
+use smooth_operator_server::state::AppState;
+use smooth_operator_server::{config::ServerConfig, protocol, runner};
 
 use crate::config::LambdaConfig;
 use crate::poster::ConnectionPoster;
 
 /// The agent's display name.
 const AGENT_NAME: &str = "smooth-agent";
+
+/// Actions this transport does not implement itself but CAN serve, by handing
+/// the frame to the reference server's own [`handler::handle_frame`].
+///
+/// Why delegate rather than reimplement: these actions are gated by
+/// `may_read_conversation`, the org+per-user predicate that decides who may see
+/// which conversation. A second copy of that predicate living here is precisely
+/// the defect class that produced this repo's cross-tenant P0s — two guards
+/// that drift until one of them checks the wrong thing. One predicate, both
+/// transports.
+///
+/// The set is deliberately narrow: every member is connection-INDEPENDENT and
+/// spawns no turn, which is what makes it safe on a transport with no socket
+/// and no state between invocations. Notably absent, and staying absent:
+///
+///   - `confirm_tool_action` resumes a turn parked in connection-local state.
+///     There is no parked turn in a Lambda that already returned.
+///   - `verify_otp` / `submit_interaction` resolve against the in-process
+///     interaction registry, which does not survive an invocation either.
+///
+/// Those three still answer `UNSUPPORTED_ACTION` — an honest "this transport
+/// cannot", rather than a handler that would half-work.
+const DELEGATED_ACTIONS: &[&str] = &[
+    "get_conversation_messages",
+    "list_conversations",
+    "rename_conversation",
+];
 
 /// Handle one inbound `$default` / route-key frame: parse the action envelope,
 /// run it against DynamoDB, and post every produced event back to the
@@ -88,6 +117,9 @@ pub async fn handle_frame(
         }
         Some("send_message") => {
             send_message(storage, config, auth, poster, &parsed, request_id).await?;
+        }
+        Some(other) if DELEGATED_ACTIONS.contains(&other) => {
+            delegate_to_server(storage, config, auth, poster, &parsed, raw).await?;
         }
         Some(other) => {
             poster
@@ -692,6 +724,100 @@ async fn send_message(
                 .await?;
         }
     }
+    Ok(())
+}
+
+/// The connection's per-user conversation-read scope, derived from the frame's
+/// bearer token.
+///
+/// This is the reference server's `scope_for` rule verbatim — the verified-
+/// principal branch plus its `anonymous_scope` fallback — sourced from the frame
+/// instead of the `?token=` query string, because the lambda transport has no
+/// persistent connection to hang a principal off. It is copied as a DERIVATION,
+/// not as policy: the policy it feeds (`may_read_conversation`) stays single-
+/// sourced in the server.
+///
+/// Fails closed on a multi-user deployment: no token, or a principal with no
+/// `email` claim, owns nothing and therefore lists nothing. Single-user flavors
+/// (`none` / `disabled` / `local-token`) have no identity to scope by and stay
+/// unscoped, so the keyless/local behavior is unchanged.
+fn frame_user_scope(auth: &Arc<dyn AuthVerifier>, parsed: &Value) -> UserScope {
+    let single_user = smooth_operator::auth::is_single_user_mode(auth.mode());
+    match resolve_frame_principal(auth, parsed) {
+        Some(principal) => match principal.email {
+            Some(email) => UserScope::User(email),
+            None if single_user => UserScope::Unscoped,
+            None => UserScope::Denied,
+        },
+        None if single_user => UserScope::Unscoped,
+        None => UserScope::Denied,
+    }
+}
+
+/// Serve one [`DELEGATED_ACTIONS`] frame through the reference server's handler.
+///
+/// The bridge is the same one `send_message` already uses for streaming: the
+/// handler writes protocol events into an `UnboundedSender`, and a drain task
+/// posts each to the connection. Here the sender is dropped as soon as the
+/// handler returns, which closes the channel and lets the drain finish — these
+/// actions emit a single `immediate_response`, not a stream.
+async fn delegate_to_server(
+    storage: &Arc<dyn StorageAdapter>,
+    config: &LambdaConfig,
+    auth: &Arc<dyn AuthVerifier>,
+    poster: &ConnectionPoster,
+    parsed: &Value,
+    raw: &str,
+) -> Result<()> {
+    // Config comes from the same environment the lambda already reads, so the
+    // delegated handlers see the deployment's real settings rather than defaults.
+    let state = AppState::new(storage.clone(), ServerConfig::from_env()).with_auth(auth.clone());
+
+    let access = resolve_frame_access(auth, parsed);
+    // The frame's principal org, else the lambda's CONFIGURED org — the same
+    // fallback `create_session` stamps rows with. Passing `None` here instead
+    // would be quietly wrong in both directions: the server's org fallback is
+    // its own SEED_ORG_ID, so an unauthenticated frame would enumerate a
+    // different org than the one this deployment writes to and always come back
+    // empty; and `None` also disables the tenant half of `may_read_conversation`
+    // altogether. Naming the configured org keeps list and create agreeing, and
+    // keeps the check armed.
+    let auth_org = frame_org(auth, parsed).unwrap_or_else(|| config.org_id.clone());
+    let scope = frame_user_scope(auth, parsed);
+
+    let (tx, rx): (UnboundedSender<Value>, UnboundedReceiver<Value>) = mpsc::unbounded_channel();
+    let drain = tokio::spawn(forward_events(rx, poster.clone()));
+
+    // `conn_id` is connection-local bookkeeping the delegated actions never
+    // consult; the poster's id is the closest true value on this transport.
+    let conn_id = poster.connection_id().unwrap_or("lambda").to_string();
+    let spawned = handler::handle_frame(
+        &state,
+        &access,
+        &conn_id,
+        None,
+        Some(auth_org.as_str()),
+        &scope,
+        raw,
+        &tx,
+    )
+    .await;
+
+    // Nothing in DELEGATED_ACTIONS spawns a turn. If that ever stops being true,
+    // abort rather than leak a task whose events have nowhere to go once this
+    // invocation returns — and say so loudly, because it means the set needs
+    // revisiting, not that the abort is fine.
+    if let Some(turn) = spawned {
+        let action = parsed.get("action").and_then(Value::as_str).unwrap_or("?");
+        tracing::error!(
+            action,
+            "delegated action spawned a turn; DELEGATED_ACTIONS is wrong"
+        );
+        turn.handle.abort();
+    }
+
+    drop(tx);
+    let _ = drain.await;
     Ok(())
 }
 

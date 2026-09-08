@@ -28,11 +28,18 @@
  * uses its `s3-vectors` adapter feature.
  */
 
-import { SmoothAgentApi } from '@smooai/deploy';
-
 // SST has no native Rust builder — this is the `cargo lambda` output dir holding
-// the `bootstrap` artifact. The single place that path is declared.
-const ARTIFACT_DIR = '../../rust/target/lambda/smooai-smooth-operator-lambda';
+// the `bootstrap` artifact.
+//
+// cargo-lambda names that directory after the BINARY, and this crate's [[bin]]
+// is named `bootstrap` — so it is `target/lambda/bootstrap`, not
+// `target/lambda/<package-name>`. The package-named path was wrong and would
+// have deployed an EMPTY function: SST points at a directory, so a path that
+// does not exist is not an error here, just an empty artifact.
+//
+// CI overrides it with the dir it actually found, so a future rename cannot
+// reintroduce the same silent failure.
+const ARTIFACT_DIR = process.env.SMOOTH_LAMBDA_ARTIFACT_DIR ?? '../../rust/target/lambda/bootstrap';
 
 export default $config({
     app(input) {
@@ -50,6 +57,12 @@ export default $config({
     },
 
     async run() {
+        // DYNAMIC import, not a top-level one: `sst install` hard-fails a config
+        // with top-level imports ("this is not allowed"), which meant this file
+        // could not generate its own platform types — and so the README's
+        // documented `pnpm typecheck` verify step could never pass.
+        const { SmoothAgentApi } = await import('@smooai/deploy');
+
         // Everything reusable is in the shared construct; only the app-specific
         // artifact dir + model are passed here. The construct provisions the
         // DynamoDB single table, S3 blob bucket, S3 Vectors env wiring,

@@ -27,11 +27,11 @@
 //! posted as `error` events, never returned as Lambda errors (which would drop
 //! the connection / trigger retries).
 
-mod adapter;
-mod config;
-mod connection;
-mod dispatch;
-mod poster;
+// The modules live in the LIB (src/lib.rs) and this binary is a thin shim over
+// it. Re-declaring them here with `mod` would compile every file a second time
+// into the bin, where anything only the lib's tests use — the capturing poster
+// variant — is dead code, and clippy's `-D warnings` fails the build on it.
+use smooai_smooth_operator_lambda::{adapter, config, connection, dispatch, poster};
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -43,8 +43,8 @@ use smooth_operator::adapter::StorageAdapter;
 use smooth_operator::auth::AuthVerifier;
 use smooth_operator_adapter_dynamodb::DynamoDbAdapter;
 
-use crate::config::LambdaConfig;
-use crate::poster::ConnectionPoster;
+use config::LambdaConfig;
+use poster::ConnectionPoster;
 
 /// Process-global state, built once on cold start and reused across warm
 /// invocations: the resolved config + the DynamoDB adapter (which holds the

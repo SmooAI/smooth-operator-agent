@@ -1,0 +1,119 @@
+# Deploy the AWS-serverless flavor (deploy/sst) — API Gateway WebSocket + Rust
+# Lambda + DynamoDB + S3 blobs.
+#
+# workflow_dispatch ONLY. There is no push trigger on purpose: this provisions
+# real AWS infrastructure, and "merging deploys" is the right default for
+# application images, not for a stack that owns a database table.
+#
+# Prerequisites (one-time, and NOT doable from this workflow):
+#   1. An IAM role that trusts GitHub's OIDC provider for this repo, with
+#      permissions for the resources in deploy/sst.
+#   2. Repository variable AWS_DEPLOY_ROLE_ARN pointing at it.
+#   3. The gateway key as an SST secret, per stage:
+#        pnpm sst secret set SmoothAgentGatewayKey <key> --stage <stage>
+#      Without it the Lambda still serves protocol actions and returns a clean
+#      LLM_UNAVAILABLE for send_message — so a keyless deploy is a valid smoke
+#      test, not a broken one.
+name: Deploy SST (serverless)
+
+on:
+    workflow_dispatch:
+        inputs:
+            stage:
+                description: 'SST stage to deploy'
+                required: true
+                default: 'dev'
+                type: string
+
+concurrency:
+    # One deploy per stage at a time. SST takes a state lock; two concurrent
+    # runs against one stage fail the second and can leave the lock held.
+    group: deploy-sst-${{ inputs.stage }}
+    cancel-in-progress: false
+
+permissions:
+    id-token: write # OIDC federation to AWS
+    contents: read
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        environment: ${{ inputs.stage }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Guard production
+              # Production deploys go through a deliberate, reviewed path — not a
+              # dispatch box someone can type "production" into.
+              if: inputs.stage == 'production'
+              run: |
+                  echo "::error::refusing to deploy the production stage from workflow_dispatch"
+                  exit 1
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: aarch64-unknown-linux-gnu
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: rust
+
+            # cargo-lambda cross-compiles via Zig; both are needed for the arm64
+            # `provided.al2023` bootstrap artifact SST is pointed at.
+            - name: Install cargo-lambda
+              run: |
+                  pip install ziglang
+                  cargo install cargo-lambda --locked
+
+            - name: Build the Lambda bootstrap (arm64)
+              working-directory: rust
+              run: cargo lambda build --release --arm64 -p smooai-smooth-operator-lambda
+
+            - name: Locate the Lambda bootstrap
+              id: artifact
+              # cargo-lambda writes target/lambda/<BINARY-NAME>/bootstrap, and this
+              # crate's [[bin]] is literally named `bootstrap` — so the directory is
+              # target/lambda/bootstrap, NOT target/lambda/<package-name>. Discover it
+              # instead of hard-coding, because a rename of either would silently move
+              # it again and SST points at a DIRECTORY: a wrong path deploys an empty
+              # function rather than failing.
+              run: |
+                  found=$(find rust/target/lambda -name bootstrap -type f -print -quit)
+                  test -n "$found" || { echo "::error::no bootstrap artifact under rust/target/lambda"; find rust/target/lambda -maxdepth 2 || true; exit 1; }
+                  dir=$(dirname "$found")
+                  echo "artifact_dir=$dir" >> "$GITHUB_OUTPUT"
+                  echo "found bootstrap at $found"
+
+            # No `version:` on purpose — package.json pins
+            # `packageManager: pnpm@10.34.5`, and action-setup honours that pin
+            # when no version is given. Specifying one here can override the pin
+            # and produce a pnpm whose lockfile format differs from the committed
+            # one, which surfaces as a --frozen-lockfile failure.
+            - uses: pnpm/action-setup@v4
+            # Toolchains come from mise.toml (node is pinned there), same as
+            # typescript.yml — not a second, drifting setup-node pin.
+            - uses: jdx/mise-action@v4
+
+            - name: Install SST
+              working-directory: deploy/sst
+              # --ignore-workspace: deploy/sst is deliberately NOT a member of the
+              # root pnpm workspace, so a plain install resolves against the root
+              # and installs nothing here.
+              run: |
+                  pnpm install --ignore-workspace --frozen-lockfile
+                  pnpm sst install
+
+            - name: Typecheck
+              working-directory: deploy/sst
+              run: pnpm typecheck
+
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+                  aws-region: us-east-2
+
+            - name: Deploy
+              working-directory: deploy/sst
+              env:
+                  SMOOTH_LAMBDA_ARTIFACT_DIR: ../../${{ steps.artifact.outputs.artifact_dir }}
+              run: pnpm sst deploy --stage ${{ inputs.stage }}

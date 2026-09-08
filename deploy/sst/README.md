@@ -1,18 +1,15 @@
 # `deploy/sst` — AWS-serverless deploy path
 
-> 📦 **The reusable resources now come from the shared
-> [`@smooai/deploy`](https://github.com/SmooAI/deploy) package** (`SmooAI/deploy`,
-> `sst/`). This `sst.config.ts` consumes them via the `SmoothAgentApi` construct
-> and keeps only the app-specific config (app name/stage/removal + the Lambda
-> artifact dir + model). The dependency is wired as a local **path dep** today —
-> `"@smooai/deploy": "file:../../../deploy/sst"` (a sibling `SmooAI/deploy`
-> checkout in the standard `~/dev/smooai/` layout). The npm-publish follow-up
-> (path dep → published `@smooai/deploy`) is tracked in
-> [`SmooAI/deploy/docs/Consuming.md`](https://github.com/SmooAI/deploy/blob/main/docs/Consuming.md#publish-follow-up).
+> 📦 **The reusable resources come from the shared
+> [`@smooai/deploy`](https://github.com/SmooAI/deploy) package**, consumed via the
+> `SmoothAgentApi` construct. This `sst.config.ts` keeps only the app-specific
+> config (app name/stage/removal + the Lambda artifact dir + model).
 >
-> ⚠️ pnpm `file:` deps are **content-addressed at install time** — after editing
-> the sibling `@smooai/deploy` source, re-run `pnpm install --force` here to pick
-> up the change before typechecking.
+> It depends on the **published `@smooai/deploy@^0.2.0`**, not the old
+> `file:../../../deploy/sst` path dep. That matters beyond tidiness: a `file:`
+> dep pointing outside the repo cannot resolve for anyone who only has this
+> repo — which is every self-hoster, and CI — so the deploy path was
+> undeployable without a sibling checkout laid out just so.
 
 SST v4 app that consumes the shared `@smooai/deploy` `SmoothAgentApi` construct,
 which provisions the AWS-serverless backend for `smooth-operator`:
@@ -52,8 +49,15 @@ cargo lambda build --release --arm64 -p smooai-smooth-operator-lambda
 This produces:
 
 ```
-rust/target/lambda/smooai-smooth-operator-lambda/bootstrap
+rust/target/lambda/bootstrap/bootstrap
 ```
+
+Note the directory is `bootstrap`, **not** the package name: cargo-lambda names it
+after the BINARY, and this crate's `[[bin]]` is `bootstrap`. The config used to
+point at `target/lambda/smooai-smooth-operator-lambda`, which does not exist —
+and because SST points at a *directory*, that is not an error, it just deploys an
+**empty function**. CI now discovers the artifact and passes its dir via
+`SMOOTH_LAMBDA_ARTIFACT_DIR`, so a rename cannot bring the silent failure back.
 
 …which is exactly the `ARTIFACT_DIR` the SST `Function` `handler` points at (with `runtime: 'provided.al2023'`, `architecture: 'arm64'`). The crate's `[[bin]]` is named `bootstrap` so the artifact matches the `provided.al2023` contract.
 
@@ -62,9 +66,14 @@ rust/target/lambda/smooai-smooth-operator-lambda/bootstrap
 ## 2. Install SST + generate platform types
 
 ```bash
-pnpm install          # also links the @smooai/deploy path dep (sibling SmooAI/deploy checkout)
-pnpm sst install      # installs providers + generates .sst/platform/config.d.ts (no AWS needed)
+pnpm install --ignore-workspace   # links the @smooai/deploy path dep (sibling SmooAI/deploy checkout)
+pnpm sst install                  # installs providers + generates .sst/platform/config.d.ts (no AWS needed)
 ```
+
+> ⚠️ **`--ignore-workspace` is required.** `deploy/sst` is deliberately not a
+> member of the root `pnpm-workspace.yaml`, so a plain `pnpm install` here
+> resolves against the repo root, reports success, and installs **nothing** into
+> this directory — leaving `sst: command not found`.
 
 > The `@smooai/deploy` construct package is a **sibling checkout** at
 > `../../../deploy` (clone `SmooAI/deploy` next to this repo). If you edit that
@@ -85,9 +94,21 @@ Without `SmoothAgentGatewayKey` the Lambda still answers protocol-only actions (
 
 ## 4. Deploy (CI only)
 
+`.github/workflows/deploy-sst.yml` — **`workflow_dispatch` only**, with a stage
+input defaulting to `dev`. It builds the arm64 bootstrap, asserts the artifact
+exists, typechecks, then deploys. It refuses the `production` stage outright.
+
 ```bash
-pnpm sst deploy --stage <stage>     # ⚠️ run from CI, not locally
+gh workflow run deploy-sst.yml -f stage=dev
 ```
+
+Two prerequisites the workflow cannot create for itself:
+
+1. An IAM role trusting GitHub's OIDC provider for this repo, with permissions
+   for the resources above.
+2. Repository variable **`AWS_DEPLOY_ROLE_ARN`** pointing at that role.
+
+Locally, deploying stays off-limits — see the warning above.
 
 ---
 

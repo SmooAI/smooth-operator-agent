@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 description = "AWS Lambda handler for smooth-operator — serves the schema-driven protocol over API Gateway WebSocket, posting events back via the API Gateway Management API. State lives in DynamoDB + S3 Vectors."
 
+# A lib target alongside the bootstrap bin. Without it this crate is
+# bin-only, integration tests cannot import it, and the serverless flavor's
+# protocol path is untestable except by deploying it.
+[lib]
+name = "smooai_smooth_operator_lambda"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bootstrap"
 path = "src/main.rs"
@@ -50,3 +57,11 @@ aws-sdk-dynamodb = "1"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+# In-memory storage for tests/protocol_smoke.rs — keeps the Lambda protocol
+# test free of Docker. DynamoDB itself is covered by the adapter's own
+# conformance suite against dynamodb-local.
+smooai-smooth-operator-adapter-memory = { path = "../adapters/in-memory" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }

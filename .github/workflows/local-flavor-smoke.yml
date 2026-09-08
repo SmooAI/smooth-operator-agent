@@ -1,0 +1,88 @@
+# E2E for the LOCAL deploy flavor — the in-memory, zero-services process a
+# self-hoster gets from `cargo run`, and the backend behind the README's
+# quickstart (examples/web-chat).
+#
+# examples/web-chat/e2e/smoke.mjs already existed and NOTHING ran it: before
+# this workflow, no file under .github/workflows referenced examples/ at all.
+# The project's front door had a test suite and no gate.
+#
+# It drives the published SDK over the real protocol — connect, open a session,
+# list conversations, stream a turn — so it exercises the same path the browser
+# app does. Deliberately KEYLESS: the probe treats "no gateway key" as a pass
+# (it verifies transport + session + protocol, not the model), which keeps this
+# job free of secrets and runnable on forks.
+name: local flavor smoke
+
+on:
+    workflow_dispatch: {}
+    pull_request:
+        paths:
+            - 'rust/**'
+            - 'typescript/**'
+            - 'examples/**'
+            - 'mise.toml'
+            - '.github/workflows/local-flavor-smoke.yml'
+
+concurrency:
+    group: local-flavor-smoke-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    smoke:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: rust
+
+            - name: Build the local-flavor server
+              working-directory: rust
+              run: cargo build -p smooai-smooth-operator-server
+
+            # No `version:` on purpose — package.json pins
+            # `packageManager: pnpm@10.34.5`, and action-setup honours that pin
+            # when no version is given. Specifying one here can override the pin
+            # and produce a pnpm whose lockfile format differs from the committed
+            # one, which surfaces as a --frozen-lockfile failure.
+            - uses: pnpm/action-setup@v4
+            # Toolchains come from mise.toml (node is pinned there), same as
+            # typescript.yml — not a second, drifting setup-node pin.
+            - uses: jdx/mise-action@v4
+
+            - name: Install
+              run: pnpm install --frozen-lockfile
+
+            # The smoke imports @smooai/smooth-operator. The workspace link
+            # exists from install, but the package resolves to dist/ — which is
+            # NOT built by install. Without this the probe dies on
+            # ERR_MODULE_NOT_FOUND for dist/index.js, which reads as a broken
+            # example rather than a missing build step.
+            - name: Build the SDK the smoke imports
+              run: pnpm --filter @smooai/smooth-operator build
+
+            - name: Start the server (in-memory, seeded KB, keyless)
+              run: |
+                  SMOOTH_AGENT_SEED_KB=1 RUST_LOG=warn \
+                    rust/target/debug/smooth-operator-server > /tmp/server.log 2>&1 &
+                  for _ in $(seq 1 60); do
+                    grep -q 'listening on' /tmp/server.log && exit 0
+                    sleep 0.5
+                  done
+                  echo "::error::server did not come up"; cat /tmp/server.log; exit 1
+
+            - name: Smoke the protocol
+              working-directory: examples/web-chat
+              env:
+                  SMOOTH_WS_URL: ws://127.0.0.1:8787/ws
+              run: node e2e/smoke.mjs
+
+            - name: Server log on failure
+              if: failure()
+              run: cat /tmp/server.log || true

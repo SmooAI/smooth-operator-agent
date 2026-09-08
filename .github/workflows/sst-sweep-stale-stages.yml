@@ -1,0 +1,110 @@
+# Remove leaked ephemeral SST stages.
+#
+# serverless-flavor-smoke.yml tears its stage down in an `if: always()` step,
+# which covers a failed probe or a failed deploy. It does NOT cover a cancelled
+# job or a dead runner — `always()` means "regardless of earlier step outcome",
+# not "regardless of whether this job keeps running". Those cases leak a live
+# API Gateway + Lambda + DynamoDB table with nothing scheduled to remove them.
+#
+# Needs ssm:GetParameter on /sst/bootstrap (to resolve the state bucket) and
+# read/list on that bucket — both already in the deploy role.
+#
+# This is the backstop: daily, remove any `pr-*` stage whose SST state file has
+# not been touched in STALE_HOURS. Deliberately conservative — it only ever
+# touches the `pr-` prefix the smoke workflow owns, so `dev`/`production` and
+# any hand-made stage are untouchable by construction.
+name: sweep stale SST stages
+
+on:
+    schedule:
+        - cron: '17 4 * * *'
+    workflow_dispatch:
+        inputs:
+            stale_hours:
+                description: 'Remove pr-* stages untouched for this many hours'
+                required: false
+                default: '12'
+                type: string
+            dry_run:
+                description: 'List what would be removed, remove nothing'
+                required: false
+                default: true
+                type: boolean
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    sweep:
+        runs-on: ubuntu-latest
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        env:
+            STALE_HOURS: ${{ inputs.stale_hours || '12' }}
+            # Scheduled runs sweep for real; manual runs default to a dry run so
+            # nobody discovers the blast radius by triggering it.
+            DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+        steps:
+            - uses: actions/checkout@v4
+
+            # No `version:` on purpose — package.json pins
+            # `packageManager: pnpm@10.34.5`, and action-setup honours that pin
+            # when no version is given. Specifying one here can override the pin
+            # and produce a pnpm whose lockfile format differs from the committed
+            # one, which surfaces as a --frozen-lockfile failure.
+            - uses: pnpm/action-setup@v4
+            # Toolchains come from mise.toml (node is pinned there), same as
+            # typescript.yml — not a second, drifting setup-node pin.
+            - uses: jdx/mise-action@v4
+
+            - name: Install SST
+              working-directory: deploy/sst
+              run: |
+                  pnpm install --ignore-workspace --frozen-lockfile
+                  pnpm sst install
+
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+                  aws-region: us-east-2
+
+            - name: Find and remove stale pr-* stages
+              working-directory: deploy/sst
+              run: |
+                  set -euo pipefail
+                  # SST v4 keeps per-stage state at s3://<state-bucket>/app/<app>/<stage>.json.
+                  # The bucket is `sst-state-<random>`, NOT `sst-state-<account>` —
+                  # its real name lives in the account-level bootstrap parameter, so
+                  # read it rather than guessing (guessing is what broke the deploy
+                  # role's S3 scope).
+                  bucket=$(aws ssm get-parameter --name /sst/bootstrap --query 'Parameter.Value' --output text \
+                             | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+                  test -n "$bucket" || { echo "::error::could not resolve the SST state bucket"; exit 1; }
+                  echo "state bucket: $bucket"
+                  cutoff=$(( $(date -u +%s) - STALE_HOURS * 3600 ))
+                  found=0
+
+                  # Process substitution, NOT a pipe: a piped `while` runs in a
+                  # subshell, so `found=1` set inside it is lost and the summary
+                  # below would always say "no stale stages" even after removing some.
+                  while read -r key modified; do
+                        [ -n "$key" ] || continue
+                        stage="$(basename "$key" .json)"
+                        # Belt and braces: never touch anything outside the prefix
+                        # the smoke workflow owns, whatever the query returned.
+                        case "$stage" in pr-*) ;; *) echo "skip non-ephemeral: $stage"; continue ;; esac
+                        ts=$(date -u -d "$modified" +%s 2>/dev/null || echo 0)
+                        if [ "$ts" -lt "$cutoff" ]; then
+                            found=1
+                            if [ "$DRY_RUN" = "true" ]; then
+                                echo "WOULD REMOVE $stage (last touched $modified)"
+                            else
+                                echo "removing $stage (last touched $modified)"
+                                pnpm sst remove --stage "$stage" || echo "::warning::failed to remove $stage"
+                            fi
+                        fi
+                  done < <(aws s3api list-objects-v2 --bucket "$bucket" \
+                             --prefix "app/smooth-operator/pr-" \
+                             --query 'Contents[].[Key,LastModified]' --output text)
+
+                  [ "$found" = "1" ] || echo "no stale pr-* stages"

@@ -1,0 +1,333 @@
+# E2E for the AWS-SERVERLESS deploy flavor: deploy an ephemeral stage, drive the
+# real protocol against API Gateway, then tear it down.
+#
+# This is the only flavor whose test costs money, so the cost design is explicit:
+#
+#   - The RUN is cents. Lambda, DynamoDB (PAY_PER_REQUEST) and API Gateway are
+#     all per-request; a handful of protocol frames is noise on the bill.
+#   - The RISK is a LEAKED STAGE, not the run. Teardown is therefore in an
+#     `if: always()` step — and that is still not enough on its own, because
+#     `always()` does not run if the job is cancelled or the runner dies. The
+#     companion sweeper (sst-sweep-stale-stages.yml) is the actual backstop.
+#
+# Keyless like the other flavors: the probe treats "no gateway key" as a pass,
+# so no LLM spend and no secret beyond the deploy role.
+name: serverless flavor smoke
+
+on:
+    workflow_dispatch:
+        inputs:
+            keep:
+                description: 'Leave the stage up after the run (manual debugging). The daily sweeper still reaps it.'
+                type: boolean
+                default: false
+    pull_request:
+        paths:
+            - 'rust/smooth-operator-lambda/**'
+            - 'deploy/sst/**'
+            - 'mise.toml'
+            - '.github/workflows/serverless-flavor-smoke.yml'
+
+concurrency:
+    # Keyed on the stage name below, so two runs never fight over one stack's
+    # SST state lock (and never tear down each other's).
+    group: serverless-smoke-${{ github.event.pull_request.number || github.ref_name }}
+    cancel-in-progress: false
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    smoke:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        # Skips cleanly on forks and before the OIDC role exists, rather than
+        # failing every PR with a credentials error.
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        env:
+            # Ephemeral, per-PR, and prefixed so the sweeper can recognise it.
+            STAGE: pr-${{ github.event.pull_request.number || github.run_id }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: aarch64-unknown-linux-gnu
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: rust
+
+            - name: Install cargo-lambda
+              run: |
+                  pip install ziglang
+                  cargo install cargo-lambda --locked
+
+            - name: Build the Lambda bootstrap (arm64)
+              working-directory: rust
+              run: cargo lambda build --release --arm64 -p smooai-smooth-operator-lambda
+
+            - name: Locate the Lambda bootstrap
+              id: artifact
+              # cargo-lambda writes target/lambda/<BINARY-NAME>/bootstrap, and this
+              # crate's [[bin]] is literally named `bootstrap` — so the directory is
+              # target/lambda/bootstrap, NOT target/lambda/<package-name>. Discover it
+              # instead of hard-coding, because a rename of either would silently move
+              # it again and SST points at a DIRECTORY: a wrong path deploys an empty
+              # function rather than failing.
+              run: |
+                  found=$(find rust/target/lambda -name bootstrap -type f -print -quit)
+                  test -n "$found" || { echo "::error::no bootstrap artifact under rust/target/lambda"; find rust/target/lambda -maxdepth 2 || true; exit 1; }
+                  dir=$(dirname "$found")
+                  echo "artifact_dir=$dir" >> "$GITHUB_OUTPUT"
+                  echo "found bootstrap at $found"
+
+            # No `version:` on purpose — package.json pins
+            # `packageManager: pnpm@10.34.5`, and action-setup honours that pin
+            # when no version is given. Specifying one here can override the pin
+            # and produce a pnpm whose lockfile format differs from the committed
+            # one, which surfaces as a --frozen-lockfile failure.
+            - uses: pnpm/action-setup@v4
+            # Toolchains come from mise.toml (node is pinned there), same as
+            # typescript.yml — not a second, drifting setup-node pin.
+            - uses: jdx/mise-action@v4
+
+            - name: Install SST
+              working-directory: deploy/sst
+              run: |
+                  pnpm install --ignore-workspace --frozen-lockfile
+                  pnpm sst install
+
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+                  aws-region: us-east-2
+
+            # Deploy BEFORE anything that can fail cheaply, so the teardown step
+            # below always has a stack to remove and never runs against nothing.
+            # `SmoothAgentGatewayKey` is an sst.Secret with no default, so a fresh
+            # stage cannot deploy until it has SOME value (SecretMissingError).
+            #
+            # This sets an obvious non-credential placeholder, deliberately. The
+            # probe is keyless by design — it verifies transport, session and
+            # protocol, and treats "no gateway key" as a pass — so a real key
+            # would buy nothing here except LLM spend and a secret to manage.
+            - name: Seed a placeholder gateway key
+              working-directory: deploy/sst
+              run: pnpm sst secret set SmoothAgentGatewayKey not-a-real-key-ci-smoke-only --stage "$STAGE"
+
+            - name: Deploy ephemeral stage
+              id: deploy
+              working-directory: deploy/sst
+              env:
+                  # Relative to deploy/sst, which is two levels down from the repo root.
+                  SMOOTH_LAMBDA_ARTIFACT_DIR: ../../${{ steps.artifact.outputs.artifact_dir }}
+              # --print-logs: without it SST reports "Unexpected error occurred.
+              # Please run with --print-logs", which on a runner means the actual
+              # cause is in a file nobody will ever see.
+              #
+              # The URL is read from THIS command's own output — SST prints the
+              # stack outputs on completion (`api: wss://…`). A separate
+              # `sst outputs` call returned nothing, and needing the deploy to
+              # succeed before the URL exists makes one step the honest shape.
+              #
+              # `set -o pipefail` is load-bearing: without it `tee` decides the
+              # step's exit status and a FAILED deploy reports success.
+              run: |
+                  set -o pipefail
+                  pnpm sst deploy --stage "$STAGE" --print-logs 2>&1 | tee /tmp/deploy.out
+                  url=$(grep -oE 'wss://[^ ]+' /tmp/deploy.out | head -1)
+                  test -n "$url" || { echo "::error::deploy succeeded but printed no wss:// URL"; exit 1; }
+                  echo "ws=$url" >> "$GITHUB_OUTPUT"
+                  echo "stage $STAGE -> $url"
+
+            - name: Install the SDK the probe imports
+              run: |
+                  pnpm install --frozen-lockfile
+                  pnpm --filter @smooai/smooth-operator build
+
+            # A raw handshake first. The SDK reports any failure as the same
+            # opaque "WebSocket connection error", which cannot distinguish
+            # "API Gateway refused the path" (403) from "the integration blew up"
+            # (500) — and with every Lambda log group empty, that distinction is
+            # the entire question.
+            #
+            # How to READ the two results, established against a known-good SST
+            # WebSocket API in the same account (smooai-brentrager-RealtimeApi):
+            #   /$default -> curl HANGS with no response. That is SUCCESS: API
+            #                Gateway accepted the upgrade and holds the socket.
+            #   /         -> 403 {"message":"Forbidden"}. That is NORMAL on the
+            #                bare host and proves nothing.
+            # So the failure signal is specifically an INSTANT 403 on the stage
+            # path. Do not read the bare-host 403 as a second symptom; it is not.
+            # Wait for the stage to actually SERVE before smoking it.
+            #
+            # The deploy returning is not the same as the edge serving: on the
+            # run that chased this for a day, deployment `uk103t` was DEPLOYED at
+            # 14:05:52 and the probe 9 seconds later still got 403 — with ZERO
+            # bytes in that stage's own access log and every Lambda log group
+            # empty, i.e. API Gateway had not picked the new stage up yet. Routes,
+            # integrations, invoke permissions, route auth and
+            # DisableExecuteApiEndpoint were all verified correct; the only thing
+            # wrong was asking too early.
+            #
+            # Reading the result, established against a known-good SST WebSocket
+            # API in the same account:
+            #   accepted -> curl TIMES OUT (exit 28). API Gateway takes the
+            #               upgrade and holds the socket, so curl never gets a
+            #               response. That is SUCCESS, however odd it looks.
+            #   refused  -> 403 {"message":"Forbidden"}.
+            # (The bare host answers 403 even on a healthy API, so it is not a
+            # useful probe and is not tried here.)
+            - name: Wait for the WebSocket stage to serve
+              env:
+                  WS: ${{ steps.deploy.outputs.ws }}
+              run: |
+                  https_url="${WS/wss:/https:}"
+                  echo "waiting for the stage to serve: $https_url"
+                  deadline=$((SECONDS + 180))
+                  while :; do
+                      # `&& rc=0 || rc=$?` because the step runs under `bash -e`:
+                      # a bare assignment from a failing command substitution
+                      # would abort the step, and a curl TIMEOUT is the outcome
+                      # we are waiting FOR.
+                      code=$(curl -sS -o /dev/null -w '%{http_code}' --http1.1 --max-time 10 \
+                                  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                                  -H "Sec-WebSocket-Version: 13" \
+                                  -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+                                  "$https_url" 2>/dev/null) && rc=0 || rc=$?
+                      if [ "$rc" -eq 28 ] || [ "$code" = "101" ]; then
+                          echo "stage is serving after ${SECONDS}s (curl rc=$rc http=$code)"
+                          break
+                      fi
+                      if [ "$SECONDS" -ge "$deadline" ]; then
+                          echo "::error::stage still refusing after ${SECONDS}s (curl rc=$rc http=$code) — this is a real misconfiguration, not propagation"
+                          curl -isS --http1.1 --max-time 10 \
+                               -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                               -H "Sec-WebSocket-Version: 13" \
+                               -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+                               "$https_url" | head -20 || true
+                          exit 1
+                      fi
+                      sleep 5
+                  done
+
+            - name: Smoke the deployed stage
+              working-directory: examples/web-chat
+              env:
+                  SMOOTH_WS_URL: ${{ steps.deploy.outputs.ws }}
+              run: node e2e/smoke.mjs
+
+            # Before teardown: the Lambda's own logs are the only way to tell a
+            # rejected $connect from a crashing handler, and the stack is about to
+            # be destroyed. Best-effort — never fail the run for a missing log.
+            - name: Lambda logs on failure
+              if: failure()
+              env:
+                  WS: ${{ steps.deploy.outputs.ws }}
+              run: |
+                  # Do NOT guess the function-name prefix. SST TRUNCATES the app
+                  # name to fit Lambda's 64-char limit, inconsistently per route —
+                  # the same deploy produced `smooth-pr-559-`, `smo-pr-559-` AND
+                  # `smooth--pr-559-`. Two earlier versions of this guessed a prefix,
+                  # found nothing, and made it look like the Lambda had never been
+                  # invoked. List everything and filter on the stage instead.
+                  for lg in $(aws logs describe-log-groups \
+                                --query "logGroups[?contains(logGroupName,'$STAGE')].logGroupName" \
+                                --output text 2>/dev/null); do
+                      echo "───── $lg"
+                      aws logs tail "$lg" --since 20m --format short 2>/dev/null | tail -40 || true
+                  done
+
+                  api=$(aws apigatewayv2 get-apis \
+                          --query "Items[?contains(Name,'$STAGE')].ApiId" --output text 2>/dev/null | head -1)
+                  # Cross-check that this is the API the deploy actually handed us.
+                  # The lookup matches on the stage string in the NAME, so a
+                  # leftover API from an earlier failed run of the same stage would
+                  # also match — and every field below would then describe the wrong
+                  # API while looking perfectly healthy.
+                  echo "───── API $api  (deployed URL was ${WS:-<unset>})"
+                  [ -n "$api" ] || exit 0
+                  case "${WS:-}" in
+                      *"$api"*) echo "   ✓ api id matches the deployed URL" ;;
+                      *) echo "::warning::api id '$api' is NOT the one in the deployed URL — inspecting the WRONG api" ;;
+                  esac
+                  echo "-- routes (RouteKey / AuthorizationType / ApiKeyRequired / Target)"
+                  # AuthorizationType is the field that matters for a 403 at the
+                  # edge: API Gateway refuses before routing to the integration,
+                  # which is exactly the signature here (403 + empty Lambda logs).
+                  aws apigatewayv2 get-routes --api-id "$api" \
+                      --query 'Items[].[RouteKey,AuthorizationType,ApiKeyRequired,Target]' --output text 2>/dev/null || true
+                  echo "-- api (ApiKeySelectionExpression / RouteSelectionExpression / Disable execute-api)"
+                  aws apigatewayv2 get-api --api-id "$api" \
+                      --query '[Name,RouteSelectionExpression,ApiKeySelectionExpression,DisableExecuteApiEndpoint]' --output text 2>/dev/null || true
+                  echo "-- integrations"
+                  aws apigatewayv2 get-integrations --api-id "$api" \
+                      --query 'Items[].[IntegrationId,IntegrationType,IntegrationUri]' --output text 2>/dev/null || true
+                  echo "-- invoke permission (empty log groups => never invoked)"
+                  # If API Gateway cannot invoke the function, the connection is
+                  # refused before any handler runs and every log group stays
+                  # empty — which is exactly what we see. This is the check that
+                  # distinguishes 'not wired' from 'wired but not permitted'.
+                  for fn in $(aws lambda list-functions \
+                                --query "Functions[?contains(FunctionName,'$STAGE')].FunctionName" \
+                                --output text 2>/dev/null); do
+                      echo "  fn: $fn"
+                      aws lambda get-policy --function-name "$fn" --query Policy --output text 2>&1 \
+                        | head -c 600 || echo "  (no resource policy — API Gateway CANNOT invoke it)"
+                      echo
+                  done
+                  # The WHOLE stage, not three hand-picked fields. `AutoDeploy: true`
+                  # plus a DeploymentId looks healthy and is not: auto-deploy can
+                  # FAIL and leave the stage pinned to an empty/older deployment,
+                  # in which case API Gateway matches no route and answers 403
+                  # before any integration runs — exactly the signature here.
+                  # `LastDeploymentStatusMessage` is the field that says so, and it
+                  # was omitted from every earlier version of this dump.
+                  echo "-- stage (full)"
+                  aws apigatewayv2 get-stages --api-id "$api" --output json 2>/dev/null || true
+
+                  dep=$(aws apigatewayv2 get-stages --api-id "$api" \
+                          --query 'Items[0].DeploymentId' --output text 2>/dev/null)
+                  if [ -n "$dep" ] && [ "$dep" != "None" ]; then
+                      echo "-- deployment $dep"
+                      aws apigatewayv2 get-deployment --api-id "$api" --deployment-id "$dep" \
+                          --query '[DeploymentStatus,DeploymentStatusMessage]' --output text 2>/dev/null || true
+                  fi
+
+                  # The API's OWN access log — the only place that records a request
+                  # API Gateway refused before routing. Resolve it from the stage's
+                  # DestinationArn rather than guessing the name: SST derives it from
+                  # a truncated physical name, so it does not reliably contain the
+                  # stage string the log-group loop above filters on.
+                  alg=$(aws apigatewayv2 get-stages --api-id "$api" \
+                          --query 'Items[0].AccessLogSettings.DestinationArn' --output text 2>/dev/null)
+                  case "$alg" in
+                      arn:aws:logs:*)
+                          alg=${alg#*:log-group:}; alg=${alg%:\*}
+                          echo "───── access log $alg"
+                          aws logs tail "$alg" --since 20m --format short 2>/dev/null | tail -40 || true
+                          ;;
+                      *) echo "-- no access log configured on the stage" ;;
+                  esac
+
+            # ALWAYS — a failed probe must still cost nothing tomorrow — but only
+            # once a deploy was actually ATTEMPTED. Unconditional `always()` fired
+            # after an early failure where pnpm had not been installed yet, so the
+            # teardown itself died on `pnpm: command not found` and reported a
+            # second, misleading failure on a run that had created nothing.
+            - name: Tear down
+              # `inputs.keep` is only ever true on a workflow_dispatch; on a PR run
+              # it is empty, so the guard is inert and teardown stays unconditional.
+              if: always() && steps.deploy.conclusion != 'skipped' && inputs.keep != true
+              # continue-on-error so a teardown failure does not MASK the real
+              # failure above it — but it still shows as a red step, and the
+              # daily sweeper is the backstop that actually guarantees no leak.
+              continue-on-error: true
+              working-directory: deploy/sst
+              run: pnpm sst remove --stage "$STAGE" --print-logs
+
+            - name: Dump SST log on failure
+              if: failure()
+              working-directory: deploy/sst
+              run: tail -200 .sst/log/sst.log || echo "no sst.log"

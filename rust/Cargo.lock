@@ -4328,6 +4328,7 @@ dependencies = [
  "serde_json",
  "smooai-smooth-operator",
  "smooai-smooth-operator-adapter-dynamodb",
+ "smooai-smooth-operator-adapter-memory",
  "smooai-smooth-operator-core",
  "smooai-smooth-operator-server",
  "tokio",
