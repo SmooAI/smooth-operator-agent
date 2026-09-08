@@ -60,9 +60,31 @@ ok('passes when any one of several changesets names the anchor', () => {
     assert.equal(r.ok, true);
 });
 
-ok('stays quiet on a PR with no changeset at all (docs/test-only)', () => {
+ok('fails a PR that touches a stamped tree with NO changeset — merged is not shipped', () => {
+    // The second failure mode, same symptom as #348: five PRs in a row changed stamped trees,
+    // merged green, and published nothing because they carried no changeset at all.
     const r = evaluate({ changedFiles: ['dotnet/server/src/Foo.cs'], changesets: [], stampedTrees: trees });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'missing');
+});
+
+ok('stays quiet on a genuinely docs/test-only PR — nothing stamped is touched', () => {
+    // The exemption the old guard was reaching for. Tests live BESIDE a stamped tree
+    // (`dotnet/server/tests`), not inside it, so they never trip the check.
+    const r = evaluate({
+        changedFiles: ['README.md', 'dotnet/server/tests/FooTests.cs'],
+        changesets: [],
+        stampedTrees: trees,
+    });
     assert.equal(r.ok, true);
+    assert.deepEqual(r.touched, []);
+});
+
+ok('an empty changeset is an explicit no-release and needs no anchor', () => {
+    // `pnpm changeset --empty` — a decision rather than an omission.
+    const r = evaluate({ changedFiles: ['dotnet/server/src/Foo.cs'], changesets: ['---\n---\n'], stampedTrees: trees });
+    assert.equal(r.ok, true);
+    assert.equal(r.reason, 'empty');
 });
 
 ok('stays quiet on a TS-only PR that never touches a stamped tree', () => {

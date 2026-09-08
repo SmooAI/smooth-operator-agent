@@ -16,12 +16,22 @@
  * unpublished until a downstream consumer read the NuGet two days later and filed a bug asking us to
  * build a feature we had already shipped. This guard turns that into a red check on the PR.
  *
- * Rule: if a PR touches a lockstep-stamped tree AND carries at least one changeset, then at least one
- * of those changesets must name the anchor.
+ * Rule: if a PR touches a lockstep-stamped tree it must carry a changeset, and at least one of those
+ * changesets must name the anchor.
  *
- * Deliberately conditioned on "carries a changeset". A docs- or test-only PR legitimately has none,
- * and failing those would train everyone to ignore the check. The bug being caught is not "no
- * changeset" — it is "a changeset that names the wrong package".
+ * The "must carry a changeset" half was added after a second failure mode showed up with the same
+ * symptom: five PRs in a row (#470, #471, #474, #488, and this repo's polyglot parity work) changed
+ * stamped trees, merged green, and published nothing — because they carried no changeset at all.
+ * Nothing in this repo distinguishes *merged* from *shipped*, so the omission is invisible until a
+ * consumer reads a stale artifact. The original guard deliberately skipped that case to avoid
+ * failing docs- or test-only PRs; in practice those do not touch a stamped tree (a manifest's
+ * directory, e.g. `dotnet/server/src`, not its sibling `tests/`), so the exemption bought nothing
+ * and cost five silent non-releases.
+ *
+ * Escape hatch is the one changesets already ships: `pnpm changeset --empty` declares "this
+ * deliberately releases nothing". An empty changeset satisfies the guard without naming the anchor,
+ * so a genuine no-release change to stamped source stays one command away rather than needing a
+ * bypass flag nobody would maintain.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -53,11 +63,18 @@ export function packagesInChangeset(text) {
 export function evaluate({ changedFiles, changesets, stampedTrees }) {
     const touched = stampedTrees.filter((tree) => changedFiles.some((f) => f === tree || f.startsWith(`${tree}/`)));
     const packages = [...new Set(changesets.flatMap(packagesInChangeset))];
-    // No changeset at all ⇒ not this guard's business (docs/test-only PRs are legitimate).
-    if (touched.length === 0 || changesets.length === 0) {
-        return { ok: true, touched, packages };
+    if (touched.length === 0) {
+        return { ok: true, reason: 'untouched', touched, packages };
     }
-    return { ok: packages.includes(ANCHOR), touched, packages };
+    if (changesets.length === 0) {
+        return { ok: false, reason: 'missing', touched, packages };
+    }
+    // `pnpm changeset --empty` — an explicit "this releases nothing", which is a decision
+    // rather than an omission, so it needs no anchor.
+    if (changesets.every((text) => packagesInChangeset(text).length === 0)) {
+        return { ok: true, reason: 'empty', touched, packages };
+    }
+    return { ok: packages.includes(ANCHOR), reason: 'anchor', touched, packages };
 }
 
 async function main() {
@@ -78,10 +95,27 @@ async function main() {
 
     // Imported, not re-listed — sync-versions.mjs stamps only when run directly.
     const { targets } = await import('./sync-versions.mjs');
-    const { ok, touched, packages } = evaluate({ changedFiles, changesets, stampedTrees: stampedTreesFrom(targets) });
+    const { ok, reason, touched, packages } = evaluate({ changedFiles, changesets, stampedTrees: stampedTreesFrom(targets) });
 
     if (ok) {
         console.log(`anchor-guard: ok (stamped trees touched: ${touched.join(', ') || 'none'})`);
+        return;
+    }
+
+    if (reason === 'missing') {
+        console.error(
+            [
+                `anchor-guard: this PR changes lockstep-stamped tree(s) — ${touched.join(', ')} — but carries NO changeset.`,
+                ``,
+                `Those trees publish to npm / NuGet / PyPI / crates.io. Without a changeset the release`,
+                `workflow bumps nothing, so the PR merges green and ships nothing — merged is not shipped,`,
+                `and nothing else in this repo tells them apart. Five PRs in a row landed that way.`,
+                ``,
+                `Fix: \`pnpm changeset\` and name ${ANCHOR} (naming other packages too is fine).`,
+                `Genuinely releasing nothing? \`pnpm changeset --empty\` says so explicitly and passes.`,
+            ].join('\n'),
+        );
+        process.exitCode = 1;
         return;
     }
 
